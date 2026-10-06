@@ -93,6 +93,49 @@ def test_visualization_plots_configured_custom_metric(
     assert count == 3
 
 
+def test_visualization_plots_configured_hit_rate(tmp_path: Path, monkeypatch) -> None:
+    processed_dir = tmp_path / "processed"
+    processed_dir.mkdir()
+    (processed_dir / "time_series_metrics.json").write_text(
+        '["vllm:prefix_cache_hit_rate"]', encoding="utf-8"
+    )
+    # Counters carry 10000 queries with no hits from before the run; the run
+    # then hits 90 of every 100 queried tokens on each of two engines.
+    stamps = [datetime(2026, 7, 14, 0, 0, s, tzinfo=timezone.utc) for s in (0, 5, 10)]
+    queries = [(ts, 5000.0 + 50 * i) for i, ts in enumerate(stamps) for _ in (0, 1)]
+    hits = [(ts, 45.0 * i) for i, ts in enumerate(stamps) for _ in (0, 1)]
+    plotted: dict[str, list] = {}
+    monkeypatch.setattr(visualize_metrics, "MATPLOTLIB_AVAILABLE", True)
+    monkeypatch.setattr(
+        visualize_metrics,
+        "collect_time_series_data",
+        lambda _metrics_dir: {
+            "pod-1": {
+                "vllm:prefix_cache_queries_total": queries,
+                "vllm:prefix_cache_hits_total": hits,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        visualize_metrics,
+        "plot_metric_time_series",
+        lambda pod_data, metric_name, *_args, **_kwargs: plotted.setdefault(
+            metric_name, pod_data["pod-1"][metric_name]
+        ),
+    )
+    monkeypatch.setattr(
+        visualize_metrics, "plot_pod_startup_times", lambda *_args: None
+    )
+    monkeypatch.setattr(visualize_metrics, "plot_replica_status", lambda *_args: None)
+
+    visualize_metrics.generate_all_visualizations(str(tmp_path))
+
+    assert [value for _, value in plotted["vllm_prefix_cache_hit_rate"]] == [
+        90.0,
+        90.0,
+    ]
+
+
 def test_report_includes_configured_custom_metric(tmp_path: Path) -> None:
     processed_dir = tmp_path / "processed"
     processed_dir.mkdir()

@@ -75,9 +75,11 @@ METRIC_DISPLAY = {
     "inference_pool_ready_pods": ("EPP Pool Ready Pods", "Count"),
 }
 
-# Computed ratio metrics: (numerator, denominator, title, ylabel, output_name)
+# Computed ratio metrics:
+# (configured name, numerator, denominator, title, ylabel, output_name)
 RATIO_METRICS = [
     (
+        "vllm:prefix_cache_hit_rate",
         "vllm:prefix_cache_hits_total",
         "vllm:prefix_cache_queries_total",
         "Prefix Cache Hit Rate",
@@ -85,6 +87,7 @@ RATIO_METRICS = [
         "vllm_prefix_cache_hit_rate",
     ),
     (
+        "vllm:external_prefix_cache_hit_rate",
         "vllm:external_prefix_cache_hits_total",
         "vllm:external_prefix_cache_queries_total",
         "External Prefix Cache Hit Rate (Cross-Instance)",
@@ -101,9 +104,10 @@ def _load_time_series_metrics(metrics_dir):
         with open(config_path, "r") as config_file:
             value = json.load(config_file)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return list(METRIC_DISPLAY)
+        value = None
     if not isinstance(value, list):
-        return list(METRIC_DISPLAY)
+        # No selection: process_metrics computes the ratios unconditionally.
+        return list(METRIC_DISPLAY) + [ratio[0] for ratio in RATIO_METRICS]
     return [name for name in value if isinstance(name, str) and name]
 
 
@@ -159,16 +163,29 @@ def parse_prometheus_metrics_with_timestamp(file_path):
 
 
 def compute_ratio_series(pod_metrics, numerator, denominator):
-    """Per-pod ratio series (numerator/denominator*100) over shared timestamps."""
+    """Per-pod rate (numerator/denominator*100) between consecutive scrapes.
+
+    The inputs are counters that keep growing across runs on the same pod, so
+    raw values would plot the average since the pod started. Series with
+    several label sets (one per engine) are summed per scrape.
+    """
     if numerator not in pod_metrics or denominator not in pod_metrics:
         return []
-    num_by_ts = {ts: val for ts, val in pod_metrics[numerator]}
-    den_by_ts = {ts: val for ts, val in pod_metrics[denominator]}
+    num_by_ts, den_by_ts = {}, {}
+    for ts, val in pod_metrics[numerator]:
+        num_by_ts[ts] = num_by_ts.get(ts, 0.0) + val
+    for ts, val in pod_metrics[denominator]:
+        den_by_ts[ts] = den_by_ts.get(ts, 0.0) + val
     common_ts = sorted(set(num_by_ts) & set(den_by_ts))
-    return [
-        (ts, (num_by_ts[ts] / den_by_ts[ts] * 100) if den_by_ts[ts] > 0 else 0.0)
-        for ts in common_ts
-    ]
+    out = []
+    for prev, curr in zip(common_ts, common_ts[1:]):
+        d_den = den_by_ts[curr] - den_by_ts[prev]
+        d_num = num_by_ts[curr] - num_by_ts[prev]
+        # no queries in the interval, or a pod restart reset the counters
+        if d_den <= 0 or d_num < 0:
+            continue
+        out.append((curr, max(0.0, min(100.0, d_num / d_den * 100))))
+    return out
 
 
 def collect_time_series_data(metrics_dir):
@@ -427,8 +444,15 @@ def generate_all_visualizations(metrics_dir, output_dir=None, context=None):
     configured_metric_set = set(configured_metrics)
 
     # Ratio metrics (computed from pairs of counters)
-    for numerator, denominator, title, ylabel, output_name in RATIO_METRICS:
-        if output_name not in configured_metric_set:
+    for (
+        metric_name,
+        numerator,
+        denominator,
+        title,
+        ylabel,
+        output_name,
+    ) in RATIO_METRICS:
+        if metric_name not in configured_metric_set:
             continue
         ratio_data = {}
         for pod_name, metrics in pod_data.items():
@@ -446,9 +470,9 @@ def generate_all_visualizations(metrics_dir, output_dir=None, context=None):
             plot_count += 1
 
     # Standard time series plots
-    ratio_output_names = {ratio[4] for ratio in RATIO_METRICS}
+    ratio_metric_names = {ratio[0] for ratio in RATIO_METRICS}
     for metric_name in configured_metrics:
-        if metric_name in ratio_output_names:
+        if metric_name in ratio_metric_names:
             continue
         has_metric = any(metric_name in m for m in pod_data.values())
         if has_metric:
